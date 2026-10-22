@@ -1,0 +1,5 @@
+{
+  "name": "claude-agent-dock",
+  "owner": { "name": "silver0416" },
+  "plugins": [{ "name": "agent-dock", "source": "./" }]
+}
