@@ -5,7 +5,7 @@ A Claude Code mod that lets Claude hand work to other coding-agent CLIs — [Cli
 - **A small switch above the prompt**, at the right: each agent's state (○ idle, ● running, ✓ done, ✗ failed) and a button that shows or hides the side panel.
 - **One tab per agent in the side panel**, showing the command, elapsed time and the run's progress as it happens: reasoning, tool calls and the final answer, unpacked from each CLI's JSON output.
 - **Delegation built in**: ask Claude "let opencode do …" and it starts the CLI in the background, keeps working, is notified when the run ends, reviews the result and carries on.
-- A toast when a run finishes, and a status line hint for the shortcut.
+- A toast when a run finishes, and the shortcut among the footer's mode labels.
 
 Claude keeps calling each CLI directly in Bash; the mod copies the command's output to `~/.claude/agent-dock/<cli>.log` for the panel (stderr is merged into stdout).
 
