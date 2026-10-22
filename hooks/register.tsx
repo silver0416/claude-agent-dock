@@ -63,6 +63,7 @@ const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
 const wrap = (command: string, log: string) =>
   [
     `mkdir -p ${quote(log.replace(/\/[^/]+$/, ''))}`,
+    `rm -f ${quote(`${log}.rc`)}`,
     `printf '%s\\n' ${START} > ${quote(log)}`,
     `{ (\n${command}\n) 2>&1; echo $? > ${quote(`${log}.rc`)}; } | tee -a ${quote(log)}`,
     `__dock_rc=$(cat ${quote(`${log}.rc`)} 2>/dev/null || echo 1)`,
@@ -267,8 +268,26 @@ function badge(run: AgentRun, now: number): { mark: string; word: string; color:
 }
 
 async function logPath($: EngineInterface, id: AgentId) {
-  const home = (await $.env.get('HOME')) ?? '/tmp'
+  // Windows: C:/Users/<name>, a path both the engine and Git Bash read.
+  const home = ((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '/tmp').replaceAll('\\', '/')
   return `${home}/.claude/agent-dock/${id}.log`
+}
+
+// The log's last lines, read by the engine itself (Windows has no tail); a log
+// too big for one read falls back to tail, then to the exit code alone.
+async function readLog($: EngineInterface, log: string): Promise<string | null> {
+  try {
+    return (await $.fs.read(log)).split('\n').slice(-READ).join('\n')
+  } catch {}
+  try {
+    const { exitCode, stdout } = await $.process.run(['tail', '-n', String(READ), log])
+    if (exitCode === 0) return stdout
+  } catch {}
+  try {
+    const rc = (await $.fs.read(`${log}.rc`)).trim()
+    return `log too large to show\n${EXIT} ${rc === '' ? 1 : rc}`
+  } catch {}
+  return null
 }
 
 // Terminal colours and other control characters, which a drawing refuses.
@@ -283,8 +302,8 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
   const run = await runOf($, id)
   if ((run.status !== 'running' && !again) || run.log === '') return
 
-  const { exitCode, stdout } = await $.process.run(['tail', '-n', String(READ), run.log])
-  if (exitCode !== 0) return
+  const stdout = await readLog($, run.log)
+  if (stdout === null) return
 
   let ended: number | null = null
   let result: RunResult | null = null
