@@ -1,5 +1,13 @@
 export type AgentId = 'cline' | 'agy' | 'opencode'
 
+export type EntryKind = 'text' | 'think' | 'tool' | 'out' | 'error' | 'info'
+
+export type Entry = { kind: EntryKind; text: string }
+
+export type RunMeta = { model: string; tokens: number; cost: number }
+
+export type RunResult = { isOk: boolean; text: string }
+
 export type AgentRun = {
   status: 'idle' | 'running' | 'done' | 'error'
   command: string
@@ -7,7 +15,9 @@ export type AgentRun = {
   startedAt: number
   endedAt: number
   exitCode: number | null
-  lines: string[]
+  lines: Entry[]
+  result: RunResult | null
+  meta: RunMeta
 }
 
 export type AgentRuns = Record<AgentId, AgentRun>

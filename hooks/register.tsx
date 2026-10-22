@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentId, AgentRun, AgentRuns } from '../types'
+import type { AgentId, AgentRun, AgentRuns, Entry, RunMeta, RunResult } from '../types'
 
 type Agent = { id: AgentId; label: string; glyph: string }
 
@@ -11,6 +11,8 @@ const AGENTS: Agent[] = [
   { id: 'opencode', label: 'OpenCode', glyph: '■' },
 ]
 
+const NO_META: RunMeta = { model: '', tokens: 0, cost: 0 }
+
 const IDLE: AgentRun = {
   status: 'idle',
   command: '',
@@ -19,21 +21,38 @@ const IDLE: AgentRun = {
   endedAt: 0,
   exitCode: null,
   lines: [],
+  result: null,
+  meta: NO_META,
 }
 
 const NONE: AgentRuns = { cline: IDLE, agy: IDLE, opencode: IDLE }
 const runs = atom({ plugin: 'agent-dock', key: 'runs' } as const, NONE)
 
-const runOf = async ($: EngineInterface, id: AgentId) => (await read($, runs))[id]
+// A run kept by an earlier version of the mod holds plain string lines.
+const settle = (run: AgentRun): AgentRun => ({
+  ...IDLE,
+  ...run,
+  lines: run.lines.map(line =>
+    typeof line === 'string' ? { kind: 'text', text: line } : line,
+  ),
+})
+
+const runOf = async ($: EngineInterface, id: AgentId) => settle((await read($, runs))[id])
 const setRun = ($: EngineInterface, id: AgentId, fn: (run: AgentRun) => AgentRun) =>
-  update($, runs, all => ({ ...all, [id]: fn(all[id]) }))
+  update($, runs, all => ({ ...all, [id]: fn(settle(all[id])) }))
 
 // A Bash command that runs one of the CLIs in command position.
 const CALL =
   /(?:^|[;&|(\n]\s*|\btimeout\s+(?:-\S+\s+)*\S+\s+)(cline|agy|opencode)(?=\s|$)/
+// Asking a CLI for its help or version is not a run.
+const HELP = /\b(?:cline|agy|opencode)\s+(?:\S+\s+)?(?:--help|-h|--version|-v)\b/
 const START = '__AGENT_DOCK_START__'
 const EXIT = '__AGENT_DOCK_EXIT__'
+const READ = 3000
 const KEEP = 400
+
+// Runs read once more after finishing empty, so each is read only once.
+const reread = new Set<string>()
 
 const paneId = (id: AgentId) => `agent-dock-${id}`
 const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
@@ -49,77 +68,139 @@ const wrap = (command: string, log: string) =>
     `(exit $__dock_rc)`,
   ].join('\n')
 
-// One log line as a person reads it; JSON events of the three CLIs unpacked.
-function format(line: string): string[] {
+// The task as the command spells it: its longest quoted string.
+function taskOf(command: string): string {
+  let best = ''
+  for (const m of command.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)) {
+    const s = (m[1] ?? m[2] ?? '').replace(/\\(.)/g, '$1')
+    if (s.length > best.length) best = s
+  }
+  return best.replace(/\s+/g, ' ').trim()
+}
+
+// The model the command names, if it names one.
+const modelOf = (command: string) =>
+  /(?:^|\s)(?:-m|--model)[=\s]+["']?([^\s"']+)/.exec(command)?.[1] ?? ''
+
+type Parsed = {
+  entries: Entry[]
+  result?: RunResult
+  meta?: Partial<RunMeta>
+  tokens?: number
+  cost?: number
+}
+
+const firstLine = (s: unknown) => {
+  const line = String(s ?? '').split('\n').find(row => row.trim() !== '') ?? ''
+  return line.length > 200 ? `${line.slice(0, 200)}…` : line
+}
+
+const brief = (input: unknown) => {
+  if (input === undefined || input === null) return ''
+  if (typeof input === 'string') return firstLine(input)
+  const values = Object.values(input as Record<string, unknown>)
+  const s = values.length === 1 && typeof values[0] === 'string'
+    ? values[0]
+    : JSON.stringify(input)
+  return firstLine(s)
+}
+
+const many = (kind: Entry['kind'], s: unknown): Entry[] =>
+  String(s ?? '')
+    .split('\n')
+    .map(text => ({ kind, text }))
+
+// One log line as the pane shows it; the JSON events of the three CLIs unpacked.
+function parse(line: string): Parsed {
   const text = line.trimEnd()
-  if (text.trim() === '') return []
-  if (!text.trimStart().startsWith('{')) return [text]
+  if (text.trim() === '') return { entries: [] }
+  if (!text.trimStart().startsWith('{')) {
+    const kind = /\b(error|failed|exception)\b/i.test(text) ? 'error' : 'text'
+    return { entries: [{ kind, text }] }
+  }
 
   let o: any
   try {
     o = JSON.parse(text)
   } catch {
-    return [text]
+    return { entries: [{ kind: 'text', text }] }
   }
-
-  const say = (s: unknown) => String(s).split('\n')
-  const think = (s: unknown) => say(s).map(row => `💭 ${row}`)
-  const brief = (input: unknown) => {
-    const s = typeof input === 'string' ? input : JSON.stringify(input ?? '')
-    return s.length > 160 ? `${s.slice(0, 160)}…` : s
-  }
-  const result = (status: unknown, seconds: unknown, response: unknown) => [
-    `── ${status ?? 'result'} ${Math.round(Number(seconds) || 0)}s ──`,
-    ...say(response),
-  ]
 
   // OpenCode: one event per part.
   const part = o.part ?? {}
-  if (part.type === 'reasoning') return think(part.text)
-  if (part.type === 'text' && typeof part.text === 'string') return say(part.text)
+  if (part.type === 'reasoning') return { entries: many('think', part.text) }
+  if (part.type === 'text' && typeof part.text === 'string') return { entries: many('text', part.text) }
   if (part.type === 'tool') {
-    return [`⚙ ${part.tool} ${brief(part.state?.input)} → ${part.state?.status ?? ''}`]
+    const state = part.state ?? {}
+    const mark = state.status === 'completed' ? ' ✓' : state.status === 'error' ? ' ✗' : ''
+    const entries: Entry[] = [{ kind: 'tool', text: `${part.tool}${mark}  ${brief(state.input)}` }]
+    if (state.status === 'error') entries.push({ kind: 'error', text: firstLine(state.error ?? state.output) })
+    else if (state.output !== undefined) entries.push({ kind: 'out', text: firstLine(state.output) })
+    return { entries }
   }
-  if (/step[-_](start|finish)/.test(String(o.type))) return []
+  if (part.type === 'step-finish') {
+    const t = part.tokens ?? {}
+    return { entries: [], tokens: (t.input ?? 0) + (t.output ?? 0), cost: part.cost ?? 0 }
+  }
+  if (/step[-_]start/.test(String(o.type))) return { entries: [] }
 
   // agy (stream-json, or the one json result).
-  if (o.event === 'init') return ['▶ started']
+  if (o.event === 'init') return { entries: [{ kind: 'info', text: 'started' }] }
   if (o.event === 'step_update') {
     const step = o.step_update ?? {}
     if (step.step_type === 'tool' && step.state === 'ACTIVE') {
-      return [`⚙ ${step.tool_name} ${brief(step.tool_info?.parameters)}`]
+      return { entries: [{ kind: 'tool', text: `${step.tool_name}  ${brief(step.tool_info?.parameters)}` }] }
     }
-    if (typeof step.text === 'string') return say(step.text)
-    return []
+    if (step.step_type === 'tool' && step.state === 'DONE' && step.tool_info?.output !== undefined) {
+      return { entries: [{ kind: 'out', text: firstLine(step.tool_info.output) }] }
+    }
+    if (typeof step.text === 'string') return { entries: many('text', step.text) }
+    return { entries: [] }
   }
-  if (o.event === 'result') {
-    const r = o.result ?? {}
-    return result(r.status, r.duration_seconds, r.response)
+  const agyResult = o.event === 'result' ? o.result ?? {} : typeof o.response === 'string' ? o : null
+  if (agyResult !== null) {
+    return {
+      entries: [],
+      result: { isOk: agyResult.status === 'SUCCESS', text: String(agyResult.response ?? '') },
+      meta: { tokens: agyResult.usage?.total_tokens ?? 0 },
+    }
   }
-  if (typeof o.response === 'string') return result(o.status, o.duration_seconds, o.response)
 
   // Cline: streamed pieces are skipped, each block shown whole at its end.
   if (o.type === 'agent_event') {
     const ev = o.event ?? {}
-    if (ev.type === 'content_end' && ev.contentType === 'text') return say(ev.text)
-    if (ev.type === 'content_end' && ev.contentType === 'reasoning') return think(ev.reasoning)
+    if (ev.type === 'content_end' && ev.contentType === 'text') return { entries: many('text', ev.text) }
+    if (ev.type === 'content_end' && ev.contentType === 'reasoning') return { entries: many('think', ev.reasoning) }
     if (ev.type === 'content_start' && ev.contentType === 'tool') {
-      return [`⚙ ${ev.toolName} ${brief(ev.input)}`]
+      return { entries: [{ kind: 'tool', text: `${ev.toolName}  ${brief(ev.input)}` }] }
     }
-    return []
+    if (ev.type === 'content_end' && ev.contentType === 'tool') {
+      const out = Array.isArray(ev.output) ? ev.output.map((x: any) => x?.result ?? x).join('\n') : ev.output
+      return { entries: [{ kind: 'out', text: firstLine(typeof out === 'string' ? out : JSON.stringify(out)) }] }
+    }
+    return { entries: [] }
   }
   if (o.type === 'run_result') {
-    return result(o.finishReason, (o.durationMs ?? 0) / 1000, o.text)
+    const usage = o.usage ?? {}
+    return {
+      entries: [],
+      result: { isOk: o.finishReason === 'completed', text: String(o.text ?? '') },
+      meta: {
+        model: o.model?.info?.name ?? o.model?.id ?? '',
+        tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+        cost: usage.totalCost ?? 0,
+      },
+    }
   }
-  if (o.type === 'hook_event') return []
+  if (o.type === 'hook_event') return { entries: [] }
 
-  if (typeof o.text === 'string' && o.text !== '') return say(o.text)
-  if (typeof o.message === 'string') return say(o.message)
-  if (typeof o.message?.content === 'string') return say(o.message.content)
-  return [`· ${o.type ?? o.event ?? 'event'}`]
+  if (typeof o.error === 'string') return { entries: [{ kind: 'error', text: o.error }] }
+  if (typeof o.text === 'string' && o.text !== '') return { entries: many('text', o.text) }
+  if (typeof o.message === 'string') return { entries: many('text', o.message) }
+  return { entries: [{ kind: 'info', text: String(o.type ?? o.event ?? 'event') }] }
 }
 
-// Cells a string takes: wide East Asian characters take two.
+// Cells a character takes: wide East Asian characters take two.
 const cells = (ch: string) => {
   const c = ch.codePointAt(0) ?? 0
   return (c >= 0x1100 && c <= 0x115f) ||
@@ -157,16 +238,22 @@ const seconds = (ms: number) => {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`
 }
 
-function badge(run: AgentRun, now: number): { text: string; color: string } {
+const count = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+
+function badge(run: AgentRun, now: number): { mark: string; word: string; color: string } {
   switch (run.status) {
     case 'running':
-      return { text: `● ${seconds(now - run.startedAt)}`, color: 'warning' }
+      return { mark: '●', word: `running ${seconds(now - run.startedAt)}`, color: 'warning' }
     case 'done':
-      return { text: '✓', color: 'success' }
+      return { mark: '✓', word: `done ${seconds(run.endedAt - run.startedAt)}`, color: 'success' }
     case 'error':
-      return { text: `✗${run.exitCode === null ? '' : ` ${run.exitCode}`}`, color: 'error' }
+      return {
+        mark: '✗',
+        word: `failed${run.exitCode === null ? '' : ` (exit ${run.exitCode})`} ${seconds(run.endedAt - run.startedAt)}`,
+        color: 'error',
+      }
     default:
-      return { text: '○', color: 'inactive' }
+      return { mark: '○', word: 'idle', color: 'inactive' }
   }
 }
 
@@ -175,33 +262,64 @@ async function logPath($: EngineInterface, id: AgentId) {
   return `${home}/.claude/agent-dock/${id}.log`
 }
 
-// Reads the run's log into its state; the exit line ends the run.
-async function poll($: EngineInterface, id: AgentId) {
-  const run = await runOf($, id)
-  if (run.status !== 'running' || run.log === '') return
+// Terminal colours and other control characters, which a drawing refuses.
+const clean = (s: string) =>
+  s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '')
+    .replaceAll('\t', '  ')
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
 
-  const { exitCode, stdout } = await $.process.run(['tail', '-n', String(KEEP), run.log])
+// Reads the run's log into its state; the exit line ends the run. `again`
+// reads a finished run's log once more, for a run whose reads came up empty.
+async function poll($: EngineInterface, id: AgentId, again = false) {
+  const run = await runOf($, id)
+  if ((run.status !== 'running' && !again) || run.log === '') return
+
+  const { exitCode, stdout } = await $.process.run(['tail', '-n', String(READ), run.log])
   if (exitCode !== 0) return
 
   let ended: number | null = null
-  const lines: string[] = []
+  let result: RunResult | null = null
+  let tokens = 0
+  let cost = 0
+  const meta: RunMeta = { ...NO_META, model: modelOf(run.command) }
+  const lines: Entry[] = []
   for (const line of stdout.split('\n')) {
     if (line.startsWith(START)) continue
     if (line.startsWith(EXIT)) {
       ended = Number(line.slice(EXIT.length).trim())
       continue
     }
-    lines.push(...format(line))
+    const parsed = parse(clean(line))
+    lines.push(...parsed.entries.map(entry => ({ ...entry, text: clean(entry.text) })))
+    tokens += parsed.tokens ?? 0
+    cost += parsed.cost ?? 0
+    if (parsed.result !== undefined) result = { ...parsed.result, text: clean(parsed.result.text) }
+    if (parsed.meta !== undefined) Object.assign(meta, Object.fromEntries(
+      Object.entries(parsed.meta).filter(([, v]) => v !== '' && v !== 0),
+    ))
+  }
+  if (meta.tokens === 0) meta.tokens = tokens
+  if (meta.cost === 0) meta.cost = cost
+
+  // The last block of text is the answer: kept once, in the answer box. A CLI
+  // with no result event (OpenCode) has only that block to give.
+  let from = lines.length
+  while (from > 0 && lines[from - 1]?.kind === 'text') from -= 1
+  const tail = lines.slice(from).map(entry => entry.text).join('\n').trim()
+  if (result !== null && tail !== '' && tail === result.text.trim()) lines.splice(from)
+  if (ended !== null && result === null && tail !== '') {
+    result = { isOk: ended === 0, text: tail }
+    lines.splice(from)
   }
   const now = await $.clock.now()
 
   await setRun($, id, current => {
     if (current.startedAt !== run.startedAt) return current
-    const next = { ...current, lines: lines.slice(-KEEP) }
+    const next = { ...current, lines: lines.slice(-KEEP), result, meta }
     if (ended === null) return next
     return { ...next, status: ended === 0 ? 'done' : 'error', exitCode: ended, endedAt: now }
   })
-  if (ended !== null) {
+  if (ended !== null && run.status === 'running') {
     const agent = AGENTS.find(a => a.id === id)
     $.ui.toast(`${agent?.label ?? id} finished ${ended === 0 ? '✓' : `✗ ${ended}`}`)
   }
@@ -216,7 +334,7 @@ The person may ask you to hand work to another coding-agent CLI on this machine:
 Dispatch it yourself with the Bash tool and \`run_in_background: true\`, so you can keep working; you are notified when it exits, then read its output file and carry on with whatever comes next. The person watches each run live in the agent tabs (log: ~/.claude/agent-dock/<cli>.log), so do not pipe the command into tail or head. One run per CLI at a time.
 
 - OpenCode: \`opencode run --format json --auto "<task>" < /dev/null\` (\`-m provider/model\` if asked; continue: \`-s <sessionID>\`). Its answer is the \`part.text\` of the "text" events.
-- Cline: \`cline --json -c <dir> -t 1800 "<task>" < /dev/null\` (continue: \`--id <session>\`). Its answer is the \`text\` of the "run_result" line.
+- Cline: \`cline --json -c <dir> -t 1800 "<task>" < /dev/null\` (continue: \`--id <session>\`). Its answer is the \`text\` of the "run_result" line. Cline treats a prompt with no spaces as a subcommand name and exits, so a task written without spaces (e.g. all Chinese) needs a space or an English lead-in.
 - agy: \`agy --output-format stream-json --dangerously-skip-permissions --print-timeout 1800s -p "<task>" < /dev/null\`, with \`-p "<task>"\` last (continue: \`--conversation <conversation_id>\`). Its answer is the \`response\` of the "result" event.
 
 For a question that needs no changes, use the read-only form instead: OpenCode \`--agent plan\` in place of \`--auto\`, Cline \`-p\`, agy \`--mode plan\` without the skip flag.
@@ -244,6 +362,15 @@ async function toggleDock($: EngineInterface) {
   $.ui.invalidate('ui.render')
 }
 
+const PREFIX: Record<Entry['kind'], string> = {
+  text: '',
+  think: '┊ ',
+  tool: '⚙ ',
+  out: '  ↳ ',
+  error: '✗ ',
+  info: '· ',
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -259,7 +386,7 @@ export const register: Register = on => {
           await poll($, agent.id)
         }
         if (isRunning) $.ui.invalidate('ui.render')
-      })()
+      })().catch(err => $.ui.toast(`agent-dock: ${String(err)}`))
     })
     await $.command.register({
       name: 'agent-dock',
@@ -289,7 +416,7 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const found = CALL.exec(e.command)
-    if (found === null || e.command.includes(EXIT)) return next(e)
+    if (found === null || e.command.includes(EXIT) || HELP.test(e.command)) return next(e)
 
     const id = found[1] as AgentId
     const log = await logPath($, id)
@@ -300,6 +427,7 @@ export const register: Register = on => {
       command: e.command,
       log,
       startedAt,
+      meta: { ...NO_META, model: modelOf(e.command) },
     }))
 
     const ran = await next({ ...e, command: wrap(e.command, log) })
@@ -330,11 +458,11 @@ export const register: Register = on => {
       <Box flexDirection="row" justifyContent="flex-end">
         <Button key="toggle" plain onPress={() => toggleDock($)}>
           {AGENTS.map(agent => {
-            const mark = badge(all[agent.id], now)
+            const b = badge(settle(all[agent.id]), now)
             return (
-              <Text color={mark.color}>
+              <Text color={b.color}>
                 {agent.glyph}
-                {mark.text.slice(0, 1)}{' '}
+                {b.mark}{' '}
               </Text>
             )
           })}
@@ -347,44 +475,104 @@ export const register: Register = on => {
   // One tab per agent, all three kept open together.
   for (const agent of AGENTS) {
     on('ui.render', { component: 'Pane', requestId: paneId(agent.id) }, async ($, e) => {
-      const { Box, Button, Text } = $.ui.resolve(e)
-      const run = (await read($, runs))[agent.id]
+      const { Box, Button, Text, Markdown } = $.ui.resolve(e)
+      const run = settle((await read($, runs))[agent.id])
+      // A finished run with nothing read: read its log once more.
+      const mark = `${agent.id}:${run.startedAt}`
+      if (run.status !== 'running' && run.log !== '' && run.lines.length === 0 &&
+        run.result === null && !reread.has(mark)) {
+        reread.add(mark)
+        void poll($, agent.id, true).then(() => $.ui.invalidate('ui.render'))
+      }
       const now = await $.clock.now()
-      const mark = badge(run, now)
-      const columns = Math.max(20, e.props.bodyColumns)
-      const room = Math.max(3, e.props.scroll.bodyRows - 3)
-      const end = run.status === 'running' ? now : run.endedAt
-      const rows = run.lines.flatMap(line => fold(line, columns)).slice(-room)
+      const b = badge(run, now)
+      const columns = Math.max(24, e.props.bodyColumns)
+      const inner = columns - 4
+      const task = taskOf(run.command)
+      const taskRows = task === '' ? [] : fold(`▸ ${task}`, inner).slice(0, 2)
+      const facts = [
+        run.meta.model,
+        run.meta.tokens > 0 ? `${count(run.meta.tokens)} tok` : '',
+        run.meta.cost > 0 ? `$${run.meta.cost.toFixed(4)}` : '',
+      ].filter(s => s !== '').join(' · ')
+
+      const header = (
+        <Box flexDirection="column" borderStyle="round" borderColor={b.color} paddingX={1}>
+          <Box flexDirection="row" justifyContent="space-between">
+            <Text bold color={b.color}>
+              {b.mark} {b.word}
+            </Text>
+            <Text dimColor wrap="truncate-start">{facts}</Text>
+          </Box>
+          {taskRows.map(row => <Text wrap="truncate-end">{row}</Text>)}
+        </Box>
+      )
+
+      if (run.status === 'idle') {
+        return (
+          <Box flexDirection="column">
+            {header}
+            <Text dimColor>No run yet.</Text>
+            <Text dimColor>Ask Claude, e.g. "let {agent.label} …"; the run shows here live.</Text>
+            <Text dimColor>{KEY} hides the tabs</Text>
+          </Box>
+        )
+      }
+
+      // The answer gets its own box; the log above it gets the rows left.
+      const answer = run.result?.text.trim() ?? ''
+      const answerRows = answer === ''
+        ? 0
+        : Math.min(answer.split('\n').flatMap(l => fold(l, inner)).length + 3, Math.floor(e.props.scroll.bodyRows / 2))
+      const room = Math.max(3, e.props.scroll.bodyRows - (3 + taskRows.length) - answerRows - 2)
+      const rows = run.lines
+        .flatMap(entry =>
+          entry.kind === 'tool' || entry.kind === 'out'
+            ? [{ kind: entry.kind, text: PREFIX[entry.kind] + entry.text }]
+            : fold(PREFIX[entry.kind] + entry.text, columns).map(text => ({ kind: entry.kind, text })),
+        )
+        .slice(-room)
 
       return (
         <Box flexDirection="column">
-          <Box flexDirection="row" justifyContent="space-between">
-            <Text>
-              <Text color={mark.color}>{mark.text}</Text>
-              <Text dimColor>
-                {run.status === 'idle' ? ' idle' : `  ${run.status} ${seconds(end - run.startedAt)}`}
-              </Text>
-            </Text>
-            <Box flexDirection="row" gap={1}>
-              {run.status !== 'idle' && run.status !== 'running' && (
-                <Button key="clear" plain dimColor label="clear"
-                  onPress={() => setRun($, agent.id, () => IDLE)} />
-              )}
-              <Text dimColor>{KEY} hides</Text>
+          {header}
+          {rows.length === 0 && (
+            <Text dimColor>{run.status === 'running' ? 'waiting for output…' : 'no output'}</Text>
+          )}
+          {rows.map(row => {
+            switch (row.kind) {
+              case 'think':
+                return <Text dimColor italic wrap="truncate-end">{row.text}</Text>
+              case 'tool':
+                return <Text color="suggestion" wrap="truncate-end">{row.text}</Text>
+              case 'out':
+                return <Text dimColor wrap="truncate-end">{row.text}</Text>
+              case 'error':
+                return <Text color="error" wrap="truncate-end">{row.text}</Text>
+              case 'info':
+                return <Text dimColor wrap="truncate-end">{row.text}</Text>
+              default:
+                return <Text wrap="truncate-end">{row.text}</Text>
+            }
+          })}
+          {answer !== '' && (
+            <Box
+              flexDirection="column"
+              borderStyle="round"
+              borderColor={run.result?.isOk === false ? 'error' : 'success'}
+              paddingX={1}
+            >
+              <Text bold color={run.result?.isOk === false ? 'error' : 'success'}>Answer</Text>
+              <Markdown text={answer} />
             </Box>
+          )}
+          <Box flexDirection="row" justifyContent="flex-end" gap={2}>
+            {run.status !== 'running' && (
+              <Button key="clear" plain dimColor label="clear"
+                onPress={() => setRun($, agent.id, () => IDLE)} />
+            )}
+            <Text dimColor>{KEY} hides</Text>
           </Box>
-          {run.command !== '' && (
-            <Text dimColor wrap="truncate-end">
-              $ {run.command.replace(/\s+/g, ' ')}
-            </Text>
-          )}
-          {rows.length === 0 ? (
-            <Text dimColor>
-              {run.status === 'running' ? 'waiting for output…' : run.status === 'idle' ? 'no run yet' : 'no output'}
-            </Text>
-          ) : (
-            rows.map(row => <Text wrap="truncate-end">{row}</Text>)
-          )}
         </Box>
       )
     })
