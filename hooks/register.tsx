@@ -406,7 +406,8 @@ export const register: Register = on => {
     const started = await next(e)
     // The pane of the earlier single-pane layout.
     await $.ui.close({ id: 'agent-dock' })
-    $.ui.status(`agents: ${KEY}`)
+    // The status line entry of earlier versions; the hint now sits in the footer.
+    $.ui.status(undefined)
     $.clock.every(1000, () => {
       void (async () => {
         let isRunning = false
@@ -478,6 +479,11 @@ export const register: Register = on => {
     }
     return ran
   })
+
+  // The key, among the dim mode labels at the right of the prompt footer.
+  on('ui.render', { component: 'SessionMode' }, async ($, e, next) =>
+    next({ ...e, props: { ...e.props, modes: [...e.props.modes, `agents: ${KEY}`] } }),
+  )
 
   // One small button at the right: each agent's mark, then show or hide.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
