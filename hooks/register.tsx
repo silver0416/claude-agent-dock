@@ -53,6 +53,8 @@ const KEEP = 400
 
 // Runs read once more after finishing empty, so each is read only once.
 const reread = new Set<string>()
+// The last polling error shown, so a lasting one is shown once.
+let lastError = ''
 
 const paneId = (id: AgentId) => `agent-dock-${id}`
 const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
@@ -62,8 +64,8 @@ const wrap = (command: string, log: string) =>
   [
     `mkdir -p ${quote(log.replace(/\/[^/]+$/, ''))}`,
     `printf '%s\\n' ${START} > ${quote(log)}`,
-    `(\n${command}\n) 2>&1 | tee -a ${quote(log)}`,
-    `__dock_rc=\${PIPESTATUS[0]}`,
+    `{ (\n${command}\n) 2>&1; echo $? > ${quote(`${log}.rc`)}; } | tee -a ${quote(log)}`,
+    `__dock_rc=$(cat ${quote(`${log}.rc`)} 2>/dev/null || echo 1)`,
     `printf '%s %s\\n' ${EXIT} "$__dock_rc" >> ${quote(log)}`,
     `(exit $__dock_rc)`,
   ].join('\n')
@@ -161,7 +163,10 @@ function parse(line: string): Parsed {
   if (agyResult !== null) {
     return {
       entries: [],
-      result: { isOk: agyResult.status === 'SUCCESS', text: String(agyResult.response ?? '') },
+      result: {
+        isOk: agyResult.status === 'SUCCESS',
+        text: String(agyResult.response || agyResult.error || ''),
+      },
       meta: { tokens: agyResult.usage?.total_tokens ?? 0 },
     }
   }
@@ -194,7 +199,11 @@ function parse(line: string): Parsed {
   }
   if (o.type === 'hook_event') return { entries: [] }
 
-  if (typeof o.error === 'string') return { entries: [{ kind: 'error', text: o.error }] }
+  // Cline's own hook plumbing complains on every run; not the run's error.
+  if (o.type === 'error' && /^hook dispatch failed/.test(String(o.message))) return { entries: [] }
+  if (o.type === 'error' && typeof o.message === 'string') return { entries: many('error', o.message) }
+  if (typeof o.error === 'string') return { entries: many('error', o.error) }
+  if (typeof o.error?.message === 'string') return { entries: many('error', o.error.message) }
   if (typeof o.text === 'string' && o.text !== '') return { entries: many('text', o.text) }
   if (typeof o.message === 'string') return { entries: many('text', o.message) }
   return { entries: [{ kind: 'info', text: String(o.type ?? o.event ?? 'event') }] }
@@ -339,7 +348,9 @@ Dispatch it yourself with the Bash tool and \`run_in_background: true\`, so you 
 
 For a question that needs no changes, use the read-only form instead: OpenCode \`--agent plan\` in place of \`--auto\`, Cline \`-p\`, agy \`--mode plan\` without the skip flag.
 
-The other agent cannot see this conversation: write the task with full context (absolute paths, the goal, how to check it is done). It works in the directory you start it in, so start it in the project the task is about. When it has edited files, review what it changed (git diff, a test run) before you report the work as done.`
+The other agent cannot see this conversation: write the task with full context (absolute paths, the goal, how to check it is done). It works in the directory you start it in, so start it in the project the task is about. When it has edited files, review what it changed (git diff, a test run) before you report the work as done.
+
+When a run fails (non-zero exit, an error event, "model unavailable", an auth or quota error), report the error to the person in one short message and stop: do not retry it, re-dispatch it, switch it to another CLI or model, or start another run unless the person asks. A notification about a run that already ended needs no new dispatch. When the error is about the model (unavailable, no longer free, unauthorized, out of credit), say which CLI and model failed and that the person picks another one in that CLI's own settings (Cline: \`cline auth\`; OpenCode: \`model\` in ~/.config/opencode/opencode.jsonc; agy: \`agy models\`).`
 
 const KEY = 'ctrl+x d'
 
@@ -386,7 +397,11 @@ export const register: Register = on => {
           await poll($, agent.id)
         }
         if (isRunning) $.ui.invalidate('ui.render')
-      })().catch(err => $.ui.toast(`agent-dock: ${String(err)}`))
+      })().catch(err => {
+        if (String(err) === lastError) return
+        lastError = String(err)
+        $.ui.toast(`agent-dock: ${lastError}`)
+      })
     })
     await $.command.register({
       name: 'agent-dock',
