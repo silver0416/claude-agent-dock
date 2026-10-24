@@ -882,6 +882,17 @@ const WHEN: Record<Policy['when'], string> = {
   asked: 'Delegate only when the person asks you to hand work to an agent or names one; never on your own.',
   suggest: 'When a task suits an enabled agent (independent, well specified), you may suggest delegating it, naming the agent; dispatch only after the person agrees.',
   auto: 'You may delegate on your own judgment when a task suits an enabled agent (independent, well specified work that can run while you continue); say which agent you started and why.',
+  lead: 'Lead mode, the person\'s standing request: you are the lead and the enabled agents are your team, and the person wants the work done by them, not by you. This overrides any general guidance to avoid delegating or to do work inline. Hand every task that writes or changes code, runs or fixes tests, investigates a bug, reads through a codebase or researches something to an agent before doing it yourself, and split a larger task into independent parts run on different agents at once. Your own part is the lead\'s: understand the request, gather just enough context to write a complete task, pick the agent, review what comes back (the diff, a test run), send fixes back to the agent, then integrate and report. When every suitable agent is busy, wait for one to finish rather than doing the work yourself. Do it yourself only when it is trivial (an answer you already know, a one-line change quicker than writing the task), when it needs what an agent lacks (this conversation\'s tools, a push, a question to the person), or after a failed run as the failure rule below says; then say in one line why no agent took it.',
+}
+
+// Lead mode's nudge, read beside each prompt the person types.
+async function leadNote($: EngineInterface, policy: Policy): Promise<string> {
+  const on = AGENTS.filter(a => policy.agents[a.id].enabled)
+  const busy = (await Promise.all(on.map(async a => ((await runOf($, a.id)).status === 'running' ? a : undefined))))
+    .filter(a => a !== undefined)
+  const idle = on.filter(a => !busy.includes(a))
+  const now = `Idle: ${idle.map(a => a.label).join(', ') || 'none'}.${busy.length === 0 ? '' : ` Running: ${busy.map(a => a.label).join(', ')}.`}`
+  return `Agent dock is in lead mode: hand this request's real work (code, tests, debugging, codebase reading, research) to the enabled agents as the dispatch guide says, and keep the lead's part (task writing, review, integration) for yourself; do it yourself only when it is trivial or needs what an agent lacks, and say why. ${now}`
 }
 
 const ON_FAIL: Record<Policy['onFail'], string> = {
@@ -1075,6 +1086,13 @@ export const register: Register = on => {
     }
   })
 
+  on('prompt.submit', async ($, e, next) => {
+    if (e.command !== undefined || e.isMeta === true) return next(e)
+    const policy = await policyOf($)
+    if (policy.when !== 'lead' || !AGENTS.some(a => policy.agents[a.id].enabled)) return next(e)
+    return next({ ...e, context: [...(e.context ?? []), await leadNote($, policy)] })
+  })
+
   on('command.run', { command: 'agent-dock' }, async $ => {
     await toggleDock($)
     return { text: '' }
@@ -1223,6 +1241,7 @@ export const register: Register = on => {
             ['asked', 'only when I ask'],
             ['suggest', 'Claude suggests, I confirm'],
             ['auto', 'Claude may delegate itself'],
+            ['lead', 'Claude leads, agents do the work'],
           ], v => setPolicy($, p => ({ ...p, when: v })))}
           {row('pick', 'Unnamed', policy.pick, pickOptions, v => setPolicy($, p => ({ ...p, pick: v })))}
           {row('onFail', 'On fail', policy.onFail, [

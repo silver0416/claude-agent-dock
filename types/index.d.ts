@@ -30,7 +30,7 @@ export type AgentPolicy = {
 }
 
 export type Policy = {
-  when: 'asked' | 'suggest' | 'auto'
+  when: 'asked' | 'suggest' | 'auto' | 'lead'
   pick: AgentId | 'claude'
   onFail: 'stop' | 'other'
   lifelike: boolean
