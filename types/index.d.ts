@@ -37,8 +37,24 @@ export type Policy = {
   agents: Record<AgentId, AgentPolicy>
 }
 
+export type Face = 'default' | 'happy' | 'surprised' | 'confused' | 'sad'
+
+// One line of the lifelike chat between Clawd and an agent, tied to its run.
+export type ChatMessage = {
+  who: 'clawd' | 'agent'
+  kind: 'handoff' | 'ack' | 'summary' | 'react'
+  text: string
+  face: Face | ''
+  run: number
+}
+
+// `streak` counts Clawd's reactions in a row that found a problem.
+export type AgentChat = { messages: ChatMessage[]; streak: number }
+
+export type AgentChats = Record<AgentId, AgentChat>
+
 declare module 'claude-code' {
   interface PluginState {
-    'agent-dock': { runs: AgentRuns }
+    'agent-dock': { runs: AgentRuns; chats: AgentChats }
   }
 }

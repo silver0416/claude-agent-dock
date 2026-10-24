@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentId, AgentPolicy, AgentRun, AgentRuns, Entry, Policy, RunMeta, RunResult } from '../types'
+import type {
+  AgentChat, AgentChats, AgentId, AgentPolicy, AgentRun, AgentRuns, ChatMessage, Entry, Face, Policy, RunMeta, RunResult,
+} from '../types'
 
 type Agent = { id: AgentId; label: string; glyph: string }
 
@@ -108,7 +110,6 @@ const mix = (a: string, b: string, t: number) => {
 // Lifelike mode: Clawd stands at the right of each tab's header and talks
 // with the agent like a coworker, each in a speech bubble.
 
-type Face = 'default' | 'happy' | 'surprised' | 'confused' | 'sad'
 
 // Clawd, 14×10 pixels, as the logo draws it with its height doubled: a top
 // row, the eyes (cut out per face), the arms right under them reaching past
@@ -179,66 +180,91 @@ const CLAWD: Record<Face, string[]> = {
 // A mark beside Clawd's head for the faces that have one.
 const FACE_MARK: Record<Face, string> = { default: '', happy: '♪', surprised: '!', confused: '?', sad: '' }
 
-type Moment = 'idle' | 'running' | 'done' | 'empty' | 'fail' | 'modelFail'
-
-const FACE_OF: Record<Moment, Face> = {
-  idle: 'default',
-  running: 'happy',
-  done: 'happy',
-  empty: 'confused',
-  fail: 'sad',
-  modelFail: 'surprised',
-}
-
-// Nothing here is scripted: Clawd says the line Claude put on the command's
-// first line, `# clawd: …` or `# clawd(<face>): …`, and the agent says the
-// `SAY: …` line its answer ends with, which the guide asks for.
+// The lifelike chat, nothing scripted. Each run adds, in order:
+// - handoff: Clawd's line, from the command's first line `# clawd(<face>): …`;
+// - ack: the agent's `ACK: …` line, the first thing its reply says;
+// - summary: its `SAY: …` line, the last (or, without one, its answer's
+//   first line, or the error);
+// - react: Clawd's reaction, which Claude sends through the clawd_react tool
+//   once it has reviewed the run.
 const CLAWD_LINE = /^\s*#\s*clawd(?:\((\w+)\))?:\s*(.+)$/m
 const SAY_LINE = /^\s*SAY:\s*(.+)$/gm
+const ACK_LINE = /^\s*ACK:\s*(.+)$/m
 
-// The agent's answer without its SAY line, which goes to the bubble instead.
-const withoutSay = (text: string) => text.replace(SAY_LINE, '').trim()
+// The agent's answer without its ACK and SAY lines, which go to the bubbles.
+const withoutSay = (text: string) =>
+  text.replace(SAY_LINE, '').replace(new RegExp(ACK_LINE.source, 'gm'), '').trim()
 
 const short = (text: string, max: number) => {
   const line = text.split('\n').find(row => row.trim() !== '')?.trim() ?? ''
   return line.length > max ? `${line.slice(0, max)}…` : line
 }
 
-function momentOf(run: AgentRun): Moment {
-  switch (run.status) {
-    case 'running':
-      return 'running'
-    case 'done':
-      return (run.result?.text.trim() ?? '') === '' && run.lines.length === 0 ? 'empty' : 'done'
-    case 'error': {
-      const said = [run.result?.text ?? '', ...run.lines.filter(l => l.kind === 'error').map(l => l.text)].join(' ')
-      return /model|unauthori[sz]ed|quota|credit|unavailable|no.route/i.test(said) ? 'modelFail' : 'fail'
-    }
-    default:
-      return 'idle'
+const NO_CHAT: AgentChat = { messages: [], streak: 0 }
+const NO_CHATS: AgentChats = { cline: NO_CHAT, agy: NO_CHAT, opencode: NO_CHAT, codex: NO_CHAT }
+const chats = atom({ plugin: 'agent-dock', key: 'chats' } as const, NO_CHATS)
+
+// The chat kept per agent: its last lines, enough for the bubbles.
+const CHAT_KEEP = 12
+// The lines shown in the header's bubbles.
+const CHAT_SHOWN = 5
+
+const chatOf = async ($: EngineInterface, id: AgentId): Promise<AgentChat> =>
+  ({ ...NO_CHAT, ...(await read($, chats))[id] })
+
+// Adds a line once per run and kind; a reaction may replace the run's last.
+async function say($: EngineInterface, id: AgentId, message: ChatMessage) {
+  const chat = await chatOf($, id)
+  const same = (m: ChatMessage) => m.run === message.run && m.kind === message.kind
+  if (message.kind !== 'react' && chat.messages.some(same)) return
+  await update($, chats, all => {
+    const now = { ...NO_CHAT, ...all[id] }
+    const messages = [...now.messages.filter(m => !(message.kind === 'react' && same(m))), message]
+    return { ...all, [id]: { ...now, messages: messages.slice(-CHAT_KEEP) } }
+  })
+}
+
+// Clawd's line for a dispatch: the command's own, else the task in brief.
+function handoffOf(command: string): { text: string; face: Face | '' } {
+  const said = CLAWD_LINE.exec(command)
+  const face = said?.[1] as Face | undefined
+  return {
+    text: said?.[2]?.trim() ?? short(taskOf(command), 40),
+    face: face !== undefined && face in CLAWD ? face : '',
   }
 }
 
-function sceneOf(run: AgentRun, now: number): { face: Face; clawd: string | null; reply: string | null } {
-  const moment = momentOf(run)
-  if (moment === 'idle') return { face: 'default', clawd: null, reply: null }
-
-  const said = CLAWD_LINE.exec(run.command)
-  const asked = said?.[1] as Face | undefined
-  const face = asked !== undefined && asked in CLAWD ? asked : FACE_OF[moment]
-  const clawd = said?.[2]?.trim() ?? short(taskOf(run.command), 40)
-
+// The agent's last word on a finished run.
+function summaryOf(run: AgentRun): string {
   const answer = run.result?.text ?? ''
   const says = [...answer.matchAll(SAY_LINE)].map(m => m[1]?.trim() ?? '').filter(s => s !== '')
+  if (says.length > 0) return says[says.length - 1]!
   const lastError = [...run.lines].reverse().find(l => l.kind === 'error')?.text ?? ''
-  const reply =
-    moment === 'running' ? '.'.repeat(1 + (Math.floor(now / 400) % 3))
-    : says.length > 0 ? says[says.length - 1]!
-    : moment === 'done' ? short(withoutSay(answer), 60)
-    : moment === 'empty' ? null
-    : short(lastError || withoutSay(answer), 60) || null
-  return { face, clawd, reply: reply === '' ? null : reply }
+  return run.status === 'error' ? short(lastError || withoutSay(answer), 80) : short(withoutSay(answer), 80)
 }
+
+// Clawd's face now: the face of its last line in this run, else the run's mood.
+function faceOf(run: AgentRun, chat: AgentChat): Face {
+  const mine = [...chat.messages].reverse().find(m => m.who === 'clawd' && m.run === run.startedAt && m.face !== '')
+  if (mine !== undefined && mine.face !== '') return mine.face
+  switch (run.status) {
+    case 'running':
+      return 'happy'
+    case 'error':
+      return 'sad'
+    default:
+      return 'default'
+  }
+}
+
+// Each reaction's mood, its face, and what it does to the problem streak.
+const MOODS = {
+  praise: { face: 'happy', isProblem: false },
+  thanks: { face: 'happy', isProblem: false },
+  problem: { face: 'confused', isProblem: true },
+  concern: { face: 'sad', isProblem: true },
+} as const satisfies Record<string, { face: Face; isProblem: boolean }>
+type Mood = keyof typeof MOODS
 
 const NO_META: RunMeta = { model: '', tokens: 0, cost: 0 }
 
@@ -320,6 +346,8 @@ const modelOf = (command: string) =>
 
 type Parsed = {
   entries: Entry[]
+  // A streamed piece of text, before its block ends (Cline).
+  delta?: string
   result?: RunResult
   meta?: Partial<RunMeta>
   tokens?: number
@@ -459,6 +487,9 @@ function parse(line: string): Parsed {
   // Cline: streamed pieces are skipped, each block shown whole at its end.
   if (o.type === 'agent_event') {
     const ev = o.event ?? {}
+    if (ev.type === 'content_start' && ev.contentType === 'text' && typeof ev.text === 'string') {
+      return { entries: [], delta: ev.text }
+    }
     if (ev.type === 'content_end' && ev.contentType === 'text') return { entries: many('text', ev.text) }
     if (ev.type === 'content_end' && ev.contentType === 'reasoning') return { entries: many('think', ev.reasoning) }
     if (ev.type === 'content_start' && ev.contentType === 'tool') {
@@ -673,6 +704,7 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
 
   let ended: number | null = null
   let result: RunResult | null = null
+  let streamed = ''
   let tokens = 0
   let cost = 0
   const meta: RunMeta = { ...NO_META, model: modelOf(run.command) }
@@ -684,6 +716,7 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
       continue
     }
     const parsed = parse(clean(line))
+    streamed += parsed.delta ?? ''
     lines.push(...parsed.entries.map(entry => ({ ...entry, text: clean(entry.text) })))
     tokens += parsed.tokens ?? 0
     cost += parsed.cost ?? 0
@@ -694,6 +727,17 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
   }
   if (meta.tokens === 0) meta.tokens = tokens
   if (meta.cost === 0) meta.cost = cost
+
+  // The agent's ACK line goes to its bubble, and out of the log.
+  const ack = ACK_LINE.exec([streamed, ...lines.filter(l => l.kind === 'text').map(l => l.text)].join('\n'))?.[1]?.trim()
+  if (ack !== undefined && ack !== '') await say($, id, { who: 'agent', kind: 'ack', text: ack, face: '', run: run.startedAt })
+  // A bare `ACK:` takes its words from the next line; both leave the log.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const text = lines[i]?.text ?? ''
+    if (lines[i]?.kind !== 'text' || !/^\s*ACK:/.test(text)) continue
+    const bare = /^\s*ACK:\s*$/.test(text) && lines[i + 1]?.kind === 'text'
+    lines.splice(i, bare ? 2 : 1)
+  }
 
   // The last block of text is the answer: kept once, in the answer box. A CLI
   // with no result event (OpenCode, Codex) has only that block to give. Notes
@@ -721,6 +765,8 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
     return { ...next, status: ended === 0 ? 'done' : 'error', exitCode: ended, endedAt: now }
   })
   if (ended !== null && run.status === 'running') {
+    const finished: AgentRun = { ...run, status: ended === 0 ? 'done' : 'error', result, lines }
+    await say($, id, { who: 'agent', kind: 'summary', text: summaryOf(finished) || '…', face: '', run: run.startedAt })
     const agent = AGENTS.find(a => a.id === id)
     $.ui.toast(`${agent?.label ?? id} finished ${ended === 0 ? '✓' : `✗ ${ended}`}`)
   }
@@ -793,10 +839,11 @@ const DISPATCH: Record<AgentId, { full: string; read: string; model: string; not
   },
 }
 
-const LIFELIKE_GUIDE = `Lifelike mode is on: each agent tab shows you, as Clawd (Claude Code's mascot), chatting with the agent in speech bubbles. Two lines feed the bubbles, and neither changes the work:
-- Make the command's first line a shell comment with what Clawd says: \`# clawd: <line>\`, or \`# clawd(happy|surprised|confused|sad): <line>\` to set Clawd's face; the CLI command goes on the next line. Write it in the person's language, short (about 25 characters in Chinese or Japanese, 60 otherwise), casual and cheerful, a coworker greeting the agent or handing it the work in a fun way, not the task text. The task you pass stays complete and plain.
-- End the task you pass with: "Finally, on a line of its own, write SAY: followed by one short line to Claude, in the voice of <persona>, in <the person's language>." Personas: Cline, an earnest and orderly robot, polite; agy, floaty and dreamy, drifting in zero gravity; OpenCode, a terse hacker of few words; Codex, confident and a little cocky.
-When you relay an agent's answer, leave its SAY line out.`
+const LIFELIKE_GUIDE = `Lifelike mode is on: each agent tab shows a chat between you, as Clawd (Claude Code's mascot), and the agent, in speech bubbles. Nothing in it is scripted, and none of it changes the work. Each run goes:
+1. Clawd hands over the work. Make the command's first line a shell comment, \`# clawd: <line>\` or \`# clawd(happy|surprised|confused|sad): <line>\` to set Clawd's face, with the CLI command on the next line. Write it in the person's language, short (about 25 characters in Chinese or Japanese, 60 otherwise), casual and cheerful, a coworker handing over the work in a fun way, not the task text. When you send work back to fix, say what to fix in the same voice. The task you pass stays complete and plain.
+2. The agent answers at once and at the end. Begin the task you pass with: "Open your first message with a line of its own: ACK: and one short line saying you got the task (not what you found), in the voice of <persona>, in <the person's language>. Write it before you read any file or think it through, and in that same message go straight on to the work: call your first tool right away. Do not end your turn after the ACK line." (Some CLIs end the run at a message with no tool call, so the ACK must not stand alone.) End it with: "Finally, on a line of its own, write SAY: and one or two short lines to Claude summing up what you did or found, in the voice of <persona>, in <the person's language>." Personas: Cline, an earnest and orderly robot, polite; agy, floaty and dreamy, drifting in zero gravity; OpenCode, a terse hacker of few words; Codex, confident and a little cocky.
+3. Clawd reacts. Once the run has ended and you have reviewed its result, call mcp__agent-dock__clawd_react once: praise or thanks when the work is good; problem when something is wrong, saying what, and then send the fix as a new run; concern when the run failed or errored, caring first. Its result tells you how many problems in a row that agent has had; past a few, Clawd gets a little impatient, playfully, never rude.
+When you relay an agent's answer, leave its ACK and SAY lines out.`
 
 const WHEN: Record<Policy['when'], string> = {
   asked: 'Delegate only when the person asks you to hand work to an agent or names one; never on your own.',
@@ -923,12 +970,51 @@ export const register: Register = on => {
     // The status line entry of earlier versions; the hint now sits in the footer.
     $.ui.status(undefined)
     startTicker($)
+    await $.tool.register({
+      name: 'clawd_react',
+      description:
+        "Lifelike mode of the agent dock: shows Clawd's reaction to an agent's finished run, in a speech bubble in that agent's tab. Call it once per run, after you have reviewed the result.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          agent: { type: 'string', enum: AGENTS.map(a => a.id), description: 'The agent whose run Clawd reacts to.' },
+          mood: {
+            type: 'string',
+            enum: Object.keys(MOODS),
+            description: 'praise or thanks when the work is good; problem when something is wrong and you will send it back; concern when the run failed or errored.',
+          },
+          text: { type: 'string', description: "Clawd's line: short, casual and cheerful, in the person's language." },
+        },
+        required: ['agent', 'mood', 'text'],
+      },
+      isDeferred: false,
+    })
     await $.command.register({
       name: 'agent-dock',
       description: `Show or hide the coding-agent CLI tabs (Cline, agy, OpenCode, Codex); ${KEY}`,
       immediate: true,
     })
     return started
+  })
+
+  // Clawd's reaction to a finished run, from Claude: the bubble, the face, and
+  // the problem streak, which the result reports back so Clawd's tone can follow.
+  on('tool.call', { tool: /^mcp__agent-dock__clawd_react$/ }, async ($, e) => {
+    const input = e as unknown as { agent?: string; mood?: string; text?: string }
+    const agent = AGENTS.find(a => a.id === input.agent)
+    const mood = MOODS[input.mood as Mood]
+    if (agent === undefined || mood === undefined || typeof input.text !== 'string' || input.text.trim() === '') {
+      return { deny: `Give agent (${AGENTS.map(a => a.id).join(', ')}), mood (${Object.keys(MOODS).join(', ')}) and text.` }
+    }
+    const run = await runOf($, agent.id)
+    const streak = mood.isProblem ? (await chatOf($, agent.id)).streak + 1 : 0
+    await update($, chats, all => ({ ...all, [agent.id]: { ...NO_CHAT, ...all[agent.id], streak } }))
+    await say($, agent.id, { who: 'clawd', kind: 'react', text: input.text.trim(), face: mood.face, run: run.startedAt })
+    $.ui.invalidate('ui.render')
+    const tone = streak >= 3
+      ? ' That is a lot in a row: let Clawd sound a little impatient now, playfully, never rude.'
+      : ''
+    return { result: `Shown in the ${agent.label} tab. Problems in a row with ${agent.label}: ${streak}.${tone}` }
   })
 
   on('prompt.compose', async ($, e, next) => {
@@ -974,6 +1060,7 @@ export const register: Register = on => {
     }))
 
     anyRunning = true
+    await say($, id, { who: 'clawd', kind: 'handoff', ...handoffOf(e.command), run: startedAt })
     const ran = await next({ ...e, command: wrap(e.command, log, startedAt) })
     await poll($, id)
 
@@ -1189,29 +1276,44 @@ export const register: Register = on => {
         ))
       const iconRows = halfBlocks(icon.rows.length, icon.rows[0]?.length ?? 0, (x, y) => pixel(agent.id, x, y))
 
-      // Lifelike mode: Clawd's line in a bubble pointing at Clawd, the agent's
-      // reply in one pointing at its icon.
-      const scene = sceneOf(run, now)
-      const clawd = CLAWD[scene.face]
+      // Lifelike mode: the chat in bubbles, Clawd's at the right pointing at
+      // Clawd, the agent's at the left pointing at its icon; a bubble of dots
+      // while one of them is still to speak.
+      const chat = await chatOf($, agent.id)
+      const face = faceOf(run, chat)
+      const clawd = CLAWD[face]
       const clawdRows = halfBlocks(clawd.length, clawd[0]?.length ?? 0, (x, y) => {
         const ch = clawd[y]?.[x] ?? '.'
         return ch === '.' ? null : ch === 't' ? '#6CB4FF' : 'claude'
       })
+      const dots = '.'.repeat(1 + (Math.floor(now / 400) % 3))
+      const said = (kind: ChatMessage['kind']) => chat.messages.some(m => m.run === run.startedAt && m.kind === kind)
+      const thread: { who: ChatMessage['who']; text: string }[] = chat.messages.slice(-CHAT_SHOWN)
+      if (run.status === 'running' && !said('ack')) thread.push({ who: 'agent', text: dots })
+      else if (run.status !== 'idle' && run.status !== 'running' && said('summary') && !said('react')) {
+        thread.push({ who: 'clawd', text: dots })
+      }
+      const shown = thread.slice(-CHAT_SHOWN)
       const bubbleColor = ACCENT[agent.id] === 'text' ? 'inactive' : ACCENT[agent.id]
-      const bubbles = lifelike && (scene.clawd !== null || scene.reply !== null) && (
+      const bubbles = lifelike && shown.length > 0 && (
         <Box flexDirection="column">
-          {scene.clawd !== null && <Box flexDirection="row" justifyContent="flex-end">
-            <Box borderStyle="round" borderColor="claude" paddingX={1} flexShrink={1}>
-              <Text>{scene.clawd}</Text>
-            </Box>
-            <Box marginTop={1}><Text color="claude">▸</Text></Box>
-          </Box>}
-          {scene.reply !== null && <Box flexDirection="row">
-            <Box marginTop={1}><Text color={bubbleColor}>◂</Text></Box>
-            <Box borderStyle="round" borderColor={bubbleColor} paddingX={1} flexShrink={1}>
-              <Text>{scene.reply}</Text>
-            </Box>
-          </Box>}
+          {shown.map(m => m.who === 'clawd'
+            ? (
+              <Box flexDirection="row" justifyContent="flex-end">
+                <Box borderStyle="round" borderColor="claude" paddingX={1} flexShrink={1}>
+                  <Text>{m.text}</Text>
+                </Box>
+                <Box marginTop={1}><Text color="claude">▸</Text></Box>
+              </Box>
+            )
+            : (
+              <Box flexDirection="row">
+                <Box marginTop={1}><Text color={bubbleColor}>◂</Text></Box>
+                <Box borderStyle="round" borderColor={bubbleColor} paddingX={1} flexShrink={1}>
+                  <Text>{m.text}</Text>
+                </Box>
+              </Box>
+            ))}
         </Box>
       )
 
@@ -1231,7 +1333,7 @@ export const register: Register = on => {
           </Box>
           {lifelike && (
             <Box flexDirection="column" flexShrink={0} alignItems="center">
-              <Text bold color="claude">{FACE_MARK[scene.face] || ' '}</Text>
+              <Text bold color="claude">{FACE_MARK[face] || ' '}</Text>
               {clawdRows}
             </Box>
           )}
@@ -1263,7 +1365,7 @@ export const register: Register = on => {
       const answerRows = answer === ''
         ? 0
         : Math.min(answer.split('\n').flatMap(l => fold(l, inner)).length + 3, Math.floor(e.props.scroll.bodyRows / 2))
-      const room = Math.max(3, e.props.scroll.bodyRows - (2 + Math.max(icon.rows.length / 2, 2 + taskRows.length + (lifelike ? 6 : 0))) - answerRows - 3)
+      const room = Math.max(3, e.props.scroll.bodyRows - (2 + Math.max(icon.rows.length / 2, 2 + taskRows.length + (bubbles === false ? 0 : shown.length * 3))) - answerRows - 3)
       const rows = run.lines
         .flatMap(entry =>
           entry.kind === 'tool' || entry.kind === 'out'
@@ -1308,7 +1410,10 @@ export const register: Register = on => {
           <Box flexDirection="row" justifyContent="flex-end" gap={2}>
             {run.status !== 'running' && (
               <Button key="clear" plain dimColor label="clear"
-                onPress={() => setRun($, agent.id, () => IDLE)} />
+                onPress={async () => {
+                  await setRun($, agent.id, () => IDLE)
+                  await update($, chats, all => ({ ...all, [agent.id]: NO_CHAT }))
+                }} />
             )}
             <Text dimColor>{KEY} hides</Text>
           </Box>
