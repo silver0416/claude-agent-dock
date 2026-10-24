@@ -55,3 +55,5 @@ The mod tells Claude to run these CLIs with their tools auto-approved (`opencode
 ## License
 
 MIT
+
+The agent icons are drawn from [LobeHub Icons](https://github.com/lobehub/lobe-icons) (MIT). Cline, Antigravity, OpenCode and Codex names and marks belong to their owners; this mod is not affiliated with them.
