@@ -1,6 +1,6 @@
 {
   "name": "agent-dock",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Taskbar of coding-agent CLIs (Cline, agy, OpenCode, Codex) with live side panes of their runs",
   "author": { "name": "silver0416" },
   "license": "MIT",

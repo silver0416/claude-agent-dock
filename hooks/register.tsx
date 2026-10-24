@@ -929,11 +929,27 @@ function guideFor(policy: Policy): string {
 
 const KEY = 'ctrl+x d'
 
-const openPanes = async ($: EngineInterface) => {
-  for (const agent of AGENTS) {
-    await $.ui.open({ id: paneId(agent.id), title: `  ${agent.glyph} ${agent.label}  `, columns: 72 })
-  }
-  await $.ui.open({ id: 'agent-dock-policy', title: '  ⚙ Policy  ', columns: 72 })
+const TABS = [
+  ...AGENTS.map(agent => ({ id: paneId(agent.id), title: `  ${agent.glyph} ${agent.label}  ` })),
+  { id: 'agent-dock-policy', title: '  ⚙ Policy  ' },
+]
+
+// The tab shown when the dock was last hidden, kept across sessions.
+const LAST_TAB_KEY = 'lastTab'
+
+// Opens every tab in order, then brings back the one shown last time: opened
+// again it is raised; where that does not raise it, it is closed and opened
+// last, which shows it at the end of the row.
+async function openPanes($: EngineInterface) {
+  for (const tab of TABS) await $.ui.open({ ...tab, columns: 72 })
+  const lastId = String((await $.store.get(LAST_TAB_KEY)) ?? '')
+  const tab = TABS.find(t => t.id === lastId)
+  if (tab === undefined || tab === TABS[TABS.length - 1]) return
+  await $.ui.open({ ...tab, columns: 72 })
+  const shown = (await $.ui.panes()).find(pane => pane.isShown)?.id
+  if (shown === tab.id) return
+  await $.ui.close({ id: tab.id })
+  await $.ui.open({ ...tab, columns: 72 })
 }
 
 const isDockOpen = async ($: EngineInterface) =>
@@ -942,8 +958,9 @@ const isDockOpen = async ($: EngineInterface) =>
 // The one switch: all the tabs come and go together.
 async function toggleDock($: EngineInterface) {
   if (await isDockOpen($)) {
-    for (const agent of AGENTS) await $.ui.close({ id: paneId(agent.id) })
-    await $.ui.close({ id: 'agent-dock-policy' })
+    const shown = (await $.ui.panes()).find(pane => pane.isShown && pane.id.startsWith('agent-dock-'))
+    if (shown !== undefined) await $.store.set(LAST_TAB_KEY, shown.id)
+    for (const tab of TABS) await $.ui.close({ id: tab.id })
   } else {
     await openPanes($)
   }
