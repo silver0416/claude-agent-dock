@@ -1,4 +1,4 @@
-export type AgentId = 'cline' | 'agy' | 'opencode'
+export type AgentId = 'cline' | 'agy' | 'opencode' | 'codex'
 
 export type EntryKind = 'text' | 'think' | 'tool' | 'out' | 'error' | 'info'
 
@@ -21,6 +21,21 @@ export type AgentRun = {
 }
 
 export type AgentRuns = Record<AgentId, AgentRun>
+
+export type AgentPolicy = {
+  enabled: boolean
+  access: 'full' | 'read'
+  model: string
+  useFor: string
+}
+
+export type Policy = {
+  when: 'asked' | 'suggest' | 'auto'
+  pick: AgentId | 'claude'
+  onFail: 'stop' | 'other'
+  lifelike: boolean
+  agents: Record<AgentId, AgentPolicy>
+}
 
 declare module 'claude-code' {
   interface PluginState {
