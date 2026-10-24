@@ -350,6 +350,16 @@ const many = (kind: Entry['kind'], s: unknown): Entry[] =>
 // `[tool] …` and `└ result` rows, or plain text.
 function plain(text: string): Entry[] {
   if (/hook dispatch failed|^Reading additional input from stdin/.test(text)) return []
+  // Codex's own log lines (`<time> ERROR codex_core::…: …`): a note, without
+  // the time or thread, so that its repeats fold into one.
+  const logged = /^\d{4}-\d\d-\d\dT[\d:.]+Z\s+(?:ERROR|WARN)\s+codex_[\w:]+:\s*(.*)$/.exec(text)
+  if (logged !== null) {
+    const said = (logged[1] ?? '').replace(/\s*(?:for )?thread [0-9a-f-]{36}(?: not found)?/g, '').trim()
+    return [{
+      kind: 'info',
+      text: /failed to record rollout/.test(said) ? 'Codex could not save this session\'s history (its state db is unavailable)' : `Codex: ${said}`,
+    }]
+  }
   const tagged = /^\[([a-z_]+)\]\s*(.*)$/.exec(text)
   if (tagged !== null) {
     const [, tag = '', rest = ''] = tagged
@@ -686,14 +696,21 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
   if (meta.cost === 0) meta.cost = cost
 
   // The last block of text is the answer: kept once, in the answer box. A CLI
-  // with no result event (OpenCode, Codex) has only that block to give.
-  let from = lines.length
+  // with no result event (OpenCode, Codex) has only that block to give. Notes
+  // and errors a CLI logs after its answer stay below it in the log.
+  let end = lines.length
+  while (end > 0 && (lines[end - 1]?.kind === 'info' || lines[end - 1]?.kind === 'error')) end -= 1
+  let from = end
   while (from > 0 && lines[from - 1]?.kind === 'text') from -= 1
-  const tail = lines.slice(from).map(entry => entry.text).join('\n').trim()
-  if (result !== null && tail !== '' && tail === result.text.trim()) lines.splice(from)
+  const tail = lines.slice(from, end).map(entry => entry.text).join('\n').trim()
+  if (result !== null && tail !== '' && tail === result.text.trim()) lines.splice(from, end - from)
   if (ended !== null && result === null && tail !== '') {
     result = { isOk: ended === 0, text: tail }
-    lines.splice(from)
+    lines.splice(from, end - from)
+  }
+  // A line a CLI repeats (a warning on every step) is shown once in a row.
+  for (let i = lines.length - 1; i > 0; i--) {
+    if (lines[i]?.kind === lines[i - 1]?.kind && lines[i]?.text === lines[i - 1]?.text) lines.splice(i, 1)
   }
   const now = await $.clock.now()
 
