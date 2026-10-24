@@ -113,14 +113,25 @@ const many = (kind: Entry['kind'], s: unknown): Entry[] =>
     .split('\n')
     .map(text => ({ kind, text }))
 
+// A line of a CLI's styled (non-JSON) output: Cline's `[thinking] …`,
+// `[tool] …` and `└ result` rows, or plain text.
+function plain(text: string): Entry[] {
+  if (/hook dispatch failed/.test(text)) return []
+  const tagged = /^\[([a-z_]+)\]\s*(.*)$/.exec(text)
+  if (tagged !== null) {
+    const [, tag = '', rest = ''] = tagged
+    return [tag === 'thinking' ? { kind: 'think', text: rest } : { kind: 'tool', text: `${tag}  ${rest}` }]
+  }
+  const result = /^\s*└\s*(.*)$/.exec(text)
+  if (result !== null) return [{ kind: 'out', text: result[1] ?? '' }]
+  return [{ kind: /\b(error|failed|exception)\b/i.test(text) ? 'error' : 'text', text }]
+}
+
 // One log line as the pane shows it; the JSON events of the three CLIs unpacked.
 function parse(line: string): Parsed {
   const text = line.trimEnd()
   if (text.trim() === '') return { entries: [] }
-  if (!text.trimStart().startsWith('{')) {
-    const kind = /\b(error|failed|exception)\b/i.test(text) ? 'error' : 'text'
-    return { entries: [{ kind, text }] }
-  }
+  if (!text.trimStart().startsWith('{')) return { entries: plain(text) }
 
   let o: any
   try {
@@ -362,7 +373,7 @@ The person may ask you to hand work to another coding-agent CLI on this machine:
 Dispatch it yourself with the Bash tool and \`run_in_background: true\`, so you can keep working; you are notified when it exits, then read its output file and carry on with whatever comes next. The person watches each run live in the agent tabs (log: ~/.claude/agent-dock/<cli>.log), so do not pipe the command into tail or head. One run per CLI at a time.
 
 - OpenCode: \`opencode run --format json --auto "<task>" < /dev/null\` (\`-m provider/model\` if asked; continue: \`-s <sessionID>\`). Its answer is the \`part.text\` of the "text" events.
-- Cline: \`cline --json -c <dir> -t 1800 "<task>" < /dev/null\` (continue: \`--id <session>\`). Its answer is the \`text\` of the "run_result" line. Cline treats a prompt with no spaces as a subcommand name and exits, so a task written without spaces (e.g. all Chinese) needs a space or an English lead-in.
+- Cline: \`cline --json -c <dir> -t 1800 "<task>" < /dev/null\` (continue: \`--id <session>\`). Its answer is the \`text\` of the "run_result" line. Always pass \`--json\`. Cline treats a prompt with no spaces as a subcommand name and exits, so a task written without spaces (e.g. all Chinese) needs a space or an English lead-in. Continuing a session with a reasoning model can fail with "\`reasoning_content\` … must be passed back to the API"; then start a fresh run that carries the needed context instead of \`--id\`.
 - agy: \`agy --output-format stream-json --dangerously-skip-permissions --print-timeout 1800s -p "<task>" < /dev/null\`, with \`-p "<task>"\` last (continue: \`--conversation <conversation_id>\`). Its answer is the \`response\` of the "result" event.
 
 For a question that needs no changes, use the read-only form instead: OpenCode \`--agent plan\` in place of \`--auto\`, Cline \`-p\`, agy \`--mode plan\` without the skip flag.
