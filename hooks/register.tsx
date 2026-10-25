@@ -1346,10 +1346,10 @@ export const register: Register = on => {
         ))
       // Pixel art: SVG where the surface has it, half blocks in a terminal.
       const picture = (alt: string, height: number, width: number, colorAt: (x: number, y: number) => string | null) =>
-        'Svg' in ui
+        e.surface !== 'terminal' && 'Svg' in ui
           ? [<ui.Svg source={svgOf(width, height, colorAt)} alt={alt} width={width * PIXEL} height={height * PIXEL} />]
           : halfBlocks(height, width, colorAt)
-      const iconRows = 'Svg' in ui
+      const iconRows = e.surface !== 'terminal' && 'Svg' in ui
         ? [<ui.Svg source={ICON_SVG[agent.id]} alt={agent.label} width={48} height={48} />]
         : picture(agent.label, icon.rows.length, icon.rows[0]?.length ?? 0, (x, y) => pixel(agent.id, x, y))
 
