@@ -305,6 +305,8 @@ const IDLE: AgentRun = {
   status: 'idle',
   command: '',
   log: '',
+  out: '',
+  outFrom: 0,
   startedAt: 0,
   endedAt: 0,
   exitCode: null,
@@ -344,9 +346,96 @@ const KEEP = 400
 const reread = new Set<string>()
 // The last polling error shown, so a lasting one is shown once.
 let lastError = ''
+// Relative output paths belong to the session's working directory.
+let cwd = ''
 
 const paneId = (id: AgentId) => `agent-dock-${id}`
 const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
+
+// The CLI's own stdout file, not redirects in its task or the next command.
+function redirectOf(command: string, home: string, cwd: string): { out: string; append: boolean } {
+  let out = ''
+  let append = false
+  let i = 0
+  const word = () => {
+    let text = ''
+    let literal = true
+    const stack: string[] = []
+    while (i < command.length) {
+      const ch = command[i]!
+      const top = stack[stack.length - 1] ?? ''
+      if (top === "'") {
+        if (ch === "'") stack.pop()
+        else text += ch
+        i += 1
+        continue
+      }
+      if (ch === '\\') {
+        const next = command[i + 1] ?? ''
+        if (top === '"' && !/["$`\\\n]/.test(next)) text += ch
+        else {
+          if (next !== '\n') text += next
+          i += 1
+        }
+        i += 1
+        continue
+      }
+      if (ch === '$' && command[i + 1] === '(') {
+        stack.push('(')
+        literal = false
+        i += 2
+        continue
+      }
+      if (top === '(' && ch === '(') stack.push('(')
+      else if (top === '(' && ch === ')') stack.pop()
+      else if (ch === '"') {
+        if (top === '"') stack.pop()
+        else stack.push('"')
+      } else if (top !== '"' && ch === "'") stack.push("'")
+      else {
+        if (stack.length === 0 && /[\s;&|<>()]/.test(ch)) break
+        if (ch === '$' || ch === '`') literal = false
+        text += ch
+      }
+      i += 1
+    }
+    return { text, literal: literal && stack.length === 0 }
+  }
+  while (i < command.length) {
+    const ch = command[i]!
+    if (ch === '\n' || ch === ';' || ch === '|' || ch === '(' || ch === ')') break
+    if (/\s/.test(ch)) { i += 1; continue }
+    const redirect = /^(?:(\d*)(>>|>\||>&|>)|(&>>|&>))/.exec(command.slice(i))
+    if (redirect !== null) {
+      i += redirect[0].length
+      while (i < command.length && /[ \t]/.test(command[i]!)) i += 1
+      const target = word()
+      const op = redirect[2] ?? redirect[3] ?? ''
+      if ((redirect[1] !== undefined && redirect[1] !== '' && redirect[1] !== '1') || op === '>&') continue
+      out = target.literal ? target.text : ''
+      if (out.startsWith('~/')) out = `${home}/${out.slice(2)}`
+      if (out !== '' && !/^(?:[A-Za-z]:)?\//.test(out)) out = cwd === '' ? '' : `${cwd}/${out}`
+      if (out !== '') {
+        const parts: string[] = []
+        for (const part of out.split('/')) {
+          if (part === '..') parts.pop()
+          else if (part !== '' && part !== '.') parts.push(part)
+        }
+        out = `${out.startsWith('/') ? '/' : ''}${parts.join('/')}`
+      }
+      if (out === '/dev/null') out = ''
+      append = out !== '' && op.endsWith('>>')
+      continue
+    }
+    if (ch === '&') break
+    if (ch === '<') { i += 1; continue }
+    word()
+  }
+  return { out, append }
+}
+
+// A command wrap() already made, not one whose task merely names the markers.
+const isWrapped = (command: string) => command.includes(`printf '%s\\n' ${START} > `)
 
 // Runs the command as written, copying its output to the log as it comes.
 // `${log}.run` names the run the log belongs to, written once the command
@@ -699,14 +788,16 @@ function commandModel(command: string): string {
 
 // The log's last lines, read by the engine itself (Windows has no tail); a log
 // too big for one read falls back to tail, then to the exit code alone.
-async function readLog($: EngineInterface, log: string): Promise<string | null> {
+async function readLog($: EngineInterface, log: string, from = 0): Promise<string | null> {
   try {
-    return (await $.fs.read(log)).split('\n').slice(-READ).join('\n')
+    return (await $.fs.read(log)).slice(from).split('\n').slice(-READ).join('\n')
   } catch {}
   try {
-    const { exitCode, stdout } = await $.process.run(['tail', '-n', String(READ), log])
-    if (exitCode === 0) return stdout
+    // An append offset counts characters in the whole file, before tailing.
+    const { exitCode, stdout } = await $.process.run(from === 0 ? ['tail', '-n', String(READ), log] : ['cat', log])
+    if (exitCode === 0) return from === 0 ? stdout : stdout.slice(from).split('\n').slice(-READ).join('\n')
   } catch {}
+  if (from !== 0) return null
   try {
     const rc = (await $.fs.read(`${log}.rc`)).trim()
     return `log too large to show\n${EXIT} ${rc === '' ? 1 : rc}`
@@ -734,20 +825,26 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
 
   const stdout = await readLog($, run.log)
   if (stdout === null) return
+  const output = run.out === '' ? null : await readLog($, run.out, run.outFrom)
 
   let ended: number | null = null
+  const rows = stdout.split('\n').filter(line => {
+    if (line.startsWith(START)) return false
+    if (!line.startsWith(EXIT)) return true
+    ended = Number(line.slice(EXIT.length).trim())
+    return false
+  })
+  const dockRows = rows.length
+  if (output !== null) rows.push(...output.split('\n'))
   let result: RunResult | null = null
   let streamed = ''
   let tokens = 0
   let cost = 0
   const meta: RunMeta = { ...NO_META, model: modelOf(run.command) }
   const lines: Entry[] = []
-  for (const line of stdout.split('\n')) {
-    if (line.startsWith(START)) continue
-    if (line.startsWith(EXIT)) {
-      ended = Number(line.slice(EXIT.length).trim())
-      continue
-    }
+  let dockLines = 0
+  for (const [index, line] of rows.entries()) {
+    if (index === dockRows) dockLines = lines.length
     const parsed = parse(clean(line))
     streamed += parsed.delta ?? ''
     lines.push(...parsed.entries.map(entry => ({ ...entry, text: clean(entry.text) })))
@@ -769,16 +866,20 @@ async function poll($: EngineInterface, id: AgentId, again = false) {
     const text = lines[i]?.text ?? ''
     if (lines[i]?.kind !== 'text' || !/^\s*ACK:/.test(text)) continue
     const bare = /^\s*ACK:\s*$/.test(text) && lines[i + 1]?.kind === 'text'
-    lines.splice(i, bare ? 2 : 1)
+    const count = bare ? 2 : 1
+    if (i < dockLines) dockLines -= Math.min(count, dockLines - i)
+    lines.splice(i, count)
   }
 
   // The last block of text is the answer: kept once, in the answer box. A CLI
   // with no result event (OpenCode, Codex) has only that block to give. Notes
   // and errors a CLI logs after its answer stay below it in the log.
+  // Shell notes in the dock log stay out of a redirected answer.
+  const answerFrom = output === null ? 0 : dockLines
   let end = lines.length
-  while (end > 0 && (lines[end - 1]?.kind === 'info' || lines[end - 1]?.kind === 'error')) end -= 1
+  while (end > answerFrom && (lines[end - 1]?.kind === 'info' || lines[end - 1]?.kind === 'error')) end -= 1
   let from = end
-  while (from > 0 && lines[from - 1]?.kind === 'text') from -= 1
+  while (from > answerFrom && lines[from - 1]?.kind === 'text') from -= 1
   const tail = lines.slice(from, end).map(entry => entry.text).join('\n').trim()
   if (result !== null && tail !== '' && tail === result.text.trim()) lines.splice(from, end - from)
   if (ended !== null && result === null && tail !== '') {
@@ -928,7 +1029,7 @@ function guideFor(policy: Policy): string {
     '# Agent dock: delegating to other coding-agent CLIs',
     `The person can hand work to these coding-agent CLIs on this machine: ${on.map(a => a.label).join(', ')}. Their dispatch policy is set in the agent dock's Policy tab (${KEY}) and is written out below; follow it.`,
     WHEN[policy.when],
-    'Dispatch with the Bash tool and `run_in_background: true`, so you can keep working; you are notified when it exits, then read its output file and carry on. The person watches each run live in the agent tabs (log: ~/.claude/agent-dock/<cli>.log), so do not pipe the command into tail or head. One run per CLI at a time. Agents marked full auto edit files and run commands without asking; for a question that needs no changes use the read-only form.',
+    'Dispatch with the Bash tool and `run_in_background: true`, so you can keep working; you are notified when it exits, then read its output file and carry on. The person watches each run live in the agent tabs (log: ~/.claude/agent-dock/<cli>.log), so do not pipe the command into tail or head, nor redirect its output to a file (`> file`, `&> file`): the tab then sees nothing. To keep a copy, end it with `| tee <file>`, which the tab still sees. One run per CLI at a time. Agents marked full auto edit files and run commands without asking; for a question that needs no changes use the read-only form.',
     lines.join('\n'),
     pick,
     ...(policy.lifelike ? [LIFELIKE_GUIDE] : []),
@@ -1022,6 +1123,7 @@ function pollFromDrawing($: EngineInterface, all: AgentRuns, now: number) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    cwd = e.cwd.replaceAll('\\', '/')
     const started = await next(e)
     // The pane of the earlier single-pane layout.
     await $.ui.close({ id: 'agent-dock' })
@@ -1106,7 +1208,7 @@ export const register: Register = on => {
     const found = CALL.exec(e.command)
     // Help asked of the CLI itself, not words in the task it is given.
     const head = found === null ? '' : e.command.slice(found.index + found[0].length - found[1]!.length).split(/["'\n]/)[0] ?? ''
-    if (found === null || e.command.includes(EXIT) || HELP.test(head)) return next(e)
+    if (found === null || isWrapped(e.command) || HELP.test(head)) return next(e)
 
     const id = found[1] as AgentId
     // The person turned it off in the Policy tab: the call does not run.
@@ -1116,12 +1218,19 @@ export const register: Register = on => {
       return { deny: `${label} is turned off in the agent dock's Policy tab (${KEY}); tell the person, and do not dispatch it another way.` }
     }
     const log = await logPath($, id)
+    const { out, append } = redirectOf(e.command.slice(found.index + found[0].length - found[1]!.length), await homeDir($), cwd)
+    let outFrom = 0
+    if (append) {
+      try { outFrom = (await $.fs.read(out)).length } catch {}
+    }
     const startedAt = await $.clock.now()
     await setRun($, id, () => ({
       ...IDLE,
       status: 'running',
       command: e.command,
       log,
+      out,
+      outFrom,
       startedAt,
       meta: { ...NO_META, model: modelOf(e.command) },
     }))

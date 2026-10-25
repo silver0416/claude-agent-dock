@@ -12,6 +12,8 @@ export type AgentRun = {
   status: 'idle' | 'running' | 'done' | 'error'
   command: string
   log: string
+  out: string
+  outFrom: number
   startedAt: number
   endedAt: number
   exitCode: number | null
