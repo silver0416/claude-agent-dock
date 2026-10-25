@@ -1104,7 +1104,9 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     startTicker($)
     const found = CALL.exec(e.command)
-    if (found === null || e.command.includes(EXIT) || HELP.test(e.command)) return next(e)
+    // Help asked of the CLI itself, not words in the task it is given.
+    const head = found === null ? '' : e.command.slice(found.index + found[0].length - found[1]!.length).split(/["'\n]/)[0] ?? ''
+    if (found === null || e.command.includes(EXIT) || HELP.test(head)) return next(e)
 
     const id = found[1] as AgentId
     // The person turned it off in the Policy tab: the call does not run.
