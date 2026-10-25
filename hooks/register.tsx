@@ -948,19 +948,16 @@ const TABS = [
 // The tab shown when the dock was last hidden, kept across sessions.
 const LAST_TAB_KEY = 'lastTab'
 
-// Opens every tab in order, then brings back the one shown last time: opened
-// again it is raised; where that does not raise it, it is closed and opened
-// last, which shows it at the end of the row.
+// Opens every tab in order (cline, agy, opencode, codex, policy), then asks
+// for the one shown last time; where the surface does not raise it, the
+// last tab shows, and the order stays.
 async function openPanes($: EngineInterface) {
   for (const tab of TABS) await $.ui.open({ ...tab, columns: 72 })
   const lastId = String((await $.store.get(LAST_TAB_KEY)) ?? '')
   const tab = TABS.find(t => t.id === lastId)
   if (tab === undefined || tab === TABS[TABS.length - 1]) return
-  await $.ui.open({ ...tab, columns: 72 })
-  const shown = (await $.ui.panes()).find(pane => pane.isShown)?.id
-  if (shown === tab.id) return
-  await $.ui.close({ id: tab.id })
-  await $.ui.open({ ...tab, columns: 72 })
+  // Asked to the front, never closed and reopened: the tabs keep their order.
+  await $.ui.open({ ...tab, columns: 72, focus: true })
 }
 
 const isDockOpen = async ($: EngineInterface) =>
